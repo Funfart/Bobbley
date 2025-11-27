@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Bobble Head Viewer</title>
+<style>
+  :root{
+    --bg:#0b0b0f;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);-webkit-tap-highlight-color:transparent;}
+  .wrap{
+    position:relative;
+    width:100%;
+    height:100vh; /* fits viewport - iframe friendly */
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+    background:var(--bg);
+  }
+  canvas{width:100%;height:100%;display:block;}
+  .controls{
+    position:absolute;
+    left:12px;
+    top:12px;
+    display:flex;
+    gap:8px;
+    z-index:10;
+  }
+  .btn{
+    background:rgba(255,255,255,0.08);
+    color:#fff;
+    border:1px solid rgba(255,255,255,0.06);
+    padding:8px 10px;
+    border-radius:8px;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto;
+    font-size:13px;
+    backdrop-filter: blur(4px);
+  }
+  .hint{
+    position:absolute;
+    bottom:16px;
+    left:50%;
+    transform:translateX(-50%);
+    color:rgba(255,255,255,0.8);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto;
+    font-size:13px;
+    padding:6px 12px;
+    border-radius:999px;
+    background:rgba(0,0,0,0.3);
+    z-index:10;
+  }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+  <canvas id="c"></canvas>
+
+  <div class="controls" id="controls">
+    <button class="btn" id="permBtn" title="Required on some iOS devices">Enable Motion</button>
+    <button class="btn" id="impulseBtn">Nudge</button>
+    <button class="btn" id="resetBtn">Reset</button>
+  </div>
+
+  <div class="hint" id="hint">Shake phone or swipe left↔right repeatedly to bobble. (Space or Nudge button works too.)</div>
+</div>
+
+<script>
+/*
+  Bobble Head Viewer
+  - Put image1.png (bobble sprite) and bg.png (background) next to this file.
+  - iframe embedding note: include allow="accelerometer; gyroscope" on the iframe tag.
+*/
+
+/* ---------- Configurable parameters ---------- */
+const BOBBLE_IMAGE = 'image1.png'; // interactive sprite
+const BG_IMAGE = 'bg.png';
+const SPRITE_SCALE = 0.6;         // relative scale for sprite compared to canvas height
+const PIVOT_Y_FACTOR = 0.85;      // pivot point measured from top of sprite (0..1) e.g. 0.85 near bottom
+const SPRING_STIFFNESS = 18.0;    // spring constant (k)
+const DAMPING = 3.2;              // damping (c)
+const MASS = 1.0;                 // mass for physics (m)
+const IMPULSE_PER_TRIGGER = 1.6;  // how much angular velocity gets added per trigger
+const SHAKE_THRESHOLD = 14;       // m/s^2 magnitude to consider as a shake (tweak per device)
+const SHAKE_COOLDOWN_MS = 250;    // ignore shakes within this period
+const SWIPE_WINDOW_MS = 700;      // timeframe to count direction changes
+const SWIPE_MIN_CHANGES = 3;      // required left-right changes to trigger
+
+/* ---------- Canvas & assets ---------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: true });
+
+let DPR = window.devicePixelRatio || 1;
+function resizeCanvas(){
+  DPR = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(rect.width * DPR));
+  canvas.height = Math.max(1, Math.floor(rect.height * DPR));
+}
+window.addEventListener('resize', resizeCanvas, { passive:true });
+
+const bg = new Image();
+bg.src = BG_IMAGE;
+bg.onload = () => { /* ok */ };
+
+const sprite = new Image();
+sprite.src = BOBBLE_IMAGE;
+
+/* ---------- Bobble physics state ---------- */
+let angle = 0;                // radians
+let angularVelocity = 0;     // rad/s
+let lastTime = performance.now();
+let running = true;
+
+/* ---------- Rendering layout ---------- */
+let spriteW = 0, spriteH = 0;
+let spriteX = 0, spriteY = 0; // top-left of sprite in canvas coords (device pixels)
+let pivotX = 0, pivotY = 0;   // pivot coords (device pixels)
+function computeLayout(){
+  // scale sprite relative to canvas height
+  const ch = canvas.height;
+  const targetH = ch * SPRITE_SCALE;
+  const aspect = (sprite.width && sprite.height) ? (sprite.width/sprite.height) : 1;
+  spriteH = targetH;
+  spriteW = targetH * aspect;
+  // center horizontally, place sprite a bit above bottom
+  spriteX = (canvas.width - spriteW) / 2;
+  spriteY = (canvas.height - spriteH) * 0.50; // tweak vertical placement
+  pivotX = spriteX + spriteW/2;
+  pivotY = spriteY + spriteH * PIVOT_Y_FACTOR;
+}
+
+/* ---------- Physics integration (simple angular spring-damper) ---------- */
+function physicsStep(dt){
+  // torque from spring: -k * angle
+  const k = SPRING_STIFFNESS;
+  const c = DAMPING;
+  const m = MASS;
+  const springTorque = -k * angle;
+  const dampingTorque = -c * angularVelocity;
+  const netTorque = springTorque + dampingTorque;
+  // angular acceleration = netTorque / m
+  const angularAcc = netTorque / m;
+  angularVelocity += angularAcc * dt;
+  angle += angularVelocity * dt;
+}
+
+/* ---------- Draw ---------- */
+function draw(){
+  // clear
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // draw bg (cover)
+  if(bg.complete && bg.naturalWidth){
+    // draw covering canvas but keep aspect ratio via cover
+    const cw = canvas.width, ch = canvas.height;
+    const iw = bg.naturalWidth, ih = bg.naturalHeight;
+    const scale = Math.max(cw/iw, ch/ih);
+    const iwScaled = iw * scale, ihScaled = ih * scale;
+    const ox = (cw - iwScaled)/2, oy = (ch - ihScaled)/2;
+    ctx.drawImage(bg, ox, oy, iwScaled, ihScaled);
+  } else {
+    // fallback background fill
+    ctx.fillStyle = '#0b0b0f';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  // draw rotating sprite around pivot
+  if(sprite.complete && sprite.naturalWidth){
+    ctx.save();
+    // Move to pivot in device pixels
+    ctx.translate(pivotX, pivotY);
+    ctx.rotate(angle);
+    // draw sprite with pivot in mind: we need to draw image so that pivot sits at (0,0) in rotated space
+    const drawX = - (pivotX - spriteX); // offset so pivot matches
+    const drawY = - (pivotY - spriteY);
+    ctx.drawImage(sprite, drawX, drawY, spriteW, spriteH);
+    ctx.restore();
+  } else {
+    // placeholder circle
+    ctx.save();
+    ctx.translate(canvas.width/2, canvas.height/2);
+    ctx.rotate(angle);
+    ctx.fillStyle = '#eee';
+    ctx.beginPath(); ctx.ellipse(0,0,80*DPR,100*DPR,0,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // optional: debug pivot
+  // ctx.fillStyle='rgba(255,0,0,0.9)'; ctx.fillRect(pivotX-4,pivotY-4,8,8);
+}
+
+/* ---------- Animation loop ---------- */
+function frame(now){
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+  physicsStep(dt);
+  draw();
+  if (running) requestAnimationFrame(frame);
+}
+
+/* ---------- Interaction: triggers add angular velocity ---------- */
+function triggerBobble(impulse = IMPULSE_PER_TRIGGER, direction = 0){
+  // direction: 0 => random, -1 => left impulse (negative angle), +1 => right
+  const sign = direction === 0 ? (Math.random() < 0.5 ? -1 : 1) : (direction < 0 ? -1 : 1);
+  angularVelocity += sign * impulse;
+}
+
+/* ---------- Shake detection (DeviceMotion) ---------- */
+let lastShakeAt = 0;
+function handleDeviceMotion(e){
+  // e.accelerationIncludingGravity or e.acceleration
+  const a = e.accelerationIncludingGravity || e.acceleration;
+  if(!a) return;
+  const ax = a.x || 0, ay = a.y || 0, az = a.z || 0;
+  // magnitude (m/s^2)
+  const mag = Math.sqrt(ax*ax + ay*ay + az*az);
+  const now = performance.now();
+  if (mag > SHAKE_THRESHOLD && (now - lastShakeAt) > SHAKE_COOLDOWN_MS){
+    lastShakeAt = now;
+    triggerBobble(IMPULSE_PER_TRIGGER);
+  }
+}
+
+/* ---------- Gesture / swipe detection ---------- */
+let lastTouchX = null;
+let lastTouchTime = 0;
+let lastDirection = 0; // -1 left, +1 right
+let directionChanges = [];
+function onPointerDown(e){
+  lastTouchX = (e.touches ? e.touches[0].clientX : e.clientX);
+  lastTouchTime = performance.now();
+}
+function onPointerMove(e){
+  if(lastTouchX === null) return;
+  const x = (e.touches ? e.touches[0].clientX : e.clientX);
+  const dx = x - lastTouchX;
+  const dir = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+  const now = performance.now();
+  if(dir !== 0 && dir !== lastDirection){
+    // record a direction change (time)
+    directionChanges.push(now);
+    lastDirection = dir;
+    // purge old changes outside window
+    const cutoff = now - SWIPE_WINDOW_MS;
+    directionChanges = directionChanges.filter(t=>t >= cutoff);
+    if(directionChanges.length >= SWIPE_MIN_CHANGES){
+      // trigger bobble with magnitude proportional to how many changes
+      const mult = Math.min(4, directionChanges.length);
+      triggerBobble(IMPULSE_PER_TRIGGER * mult, dir);
+      directionChanges = []; // reset
+    }
+  }
+  lastTouchX = x;
+}
+function onPointerUp(e){
+  lastTouchX = null;
+  lastDirection = 0;
+}
+
+/* ---------- Mouse drag support for desktop ---------- */
+let mouseIsDown = false;
+canvas.addEventListener('mousedown', (e)=>{ mouseIsDown = true; onPointerDown(e); });
+window.addEventListener('mousemove', (e)=>{ if(mouseIsDown) onPointerMove(e); });
+window.addEventListener('mouseup', (e)=>{ if(mouseIsDown){ mouseIsDown=false; onPointerUp(e); } });
+
+/* ---------- Touch support ---------- */
+canvas.addEventListener('touchstart', (e)=>{ onPointerDown(e); }, {passive:true});
+canvas.addEventListener('touchmove', (e)=>{ onPointerMove(e); }, {passive:true});
+window.addEventListener('touchend', (e)=>{ onPointerUp(e); }, {passive:true});
+
+/* ---------- Keyboard support ---------- */
+window.addEventListener('keydown', (e)=>{
+  if(e.code === 'Space'){ e.preventDefault(); triggerBobble(); }
+  if(e.key === 'ArrowLeft'){ triggerBobble(IMPULSE_PER_TRIGGER, -1); }
+  if(e.key === 'ArrowRight'){ triggerBobble(IMPULSE_PER_TRIGGER, 1); }
+});
+
+/* ---------- UI buttons ---------- */
+document.getElementById('impulseBtn').addEventListener('click', ()=> triggerBobble());
+document.getElementById('resetBtn').addEventListener('click', ()=>{
+  angle = 0; angularVelocity = 0;
+});
+/* iOS motion permission */
+const permBtn = document.getElementById('permBtn');
+async function requestMotionPermission(){
+  // For iOS 13+ Safari
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+    try{
+      const resp = await DeviceMotionEvent.requestPermission();
+      if(resp === 'granted'){
+        window.addEventListener('devicemotion', handleDeviceMotion, {passive:true});
+        permBtn.textContent = 'Motion Enabled';
+        permBtn.disabled = true;
+      } else {
+        permBtn.textContent = 'Permission Denied';
+      }
+    } catch(err){
+      console.warn('motion permission error', err);
+      permBtn.textContent = 'Permission Error';
+    }
+  } else {
+    // other browsers (most Android/chrome) don't need permission
+    window.addEventListener('devicemotion', handleDeviceMotion, {passive:true});
+    permBtn.textContent = 'Motion Enabled';
+    permBtn.disabled = true;
+  }
+}
+permBtn.addEventListener('click', requestMotionPermission);
+
+/* Also initialize by attaching devicemotion in non-iOS contexts automatically */
+if(!(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function')){
+  // not iOS requiring permission
+  window.addEventListener('devicemotion', handleDeviceMotion, {passive:true});
+  // hide perm button for a cleaner UI
+  permBtn.style.display = 'none';
+}
+
+/* ---------- Start up: layout & loop ---------- */
+function start(){
+  resizeCanvas();
+  computeLayout();
+  lastTime = performance.now();
+  requestAnimationFrame(frame);
+}
+sprite.onload = () => { computeLayout(); start(); };
+bg.onload = () => { computeLayout(); };
+
+/* ensure layout if images already cached */
+if(sprite.complete) { computeLayout(); }
+if(bg.complete) { computeLayout(); }
+resizeCanvas();
+
+/* ---------- Helpful: expose some tuning on window for debugging ---------- */
+window._bobble = {
+  trigger: triggerBobble,
+  setParams: (p)=>{ Object.assign(window, p); },
+  state: ()=>({angle, angularVelocity})
+};
+
+</script>
+</body>
+</html>
