@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Bobbley Head&copy;</title>
+<style>
+  :root{
+    --bg:#0b0b0f;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);-webkit-tap-highlight-color:transparent;}
+  .wrap{
+    position:relative;
+    width:100%;
+    height:100vh; /* fits viewport - iframe friendly */
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+    background:var(--bg);
+  }
+  canvas{width:100%;height:100%;display:block;}
+  .controls{
+    position:absolute;
+    left:12px;
+    top:12px;
+    display:flex;
+    gap:8px;
+    z-index:10;
+  }
+  .btn{
+    background:rgba(255,255,255,0.08);
+    color:#fff;
+    border:1px solid rgba(255,255,255,0.06);
+    padding:8px 10px;
+    border-radius:8px;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto;
+    font-size:13px;
+    backdrop-filter: blur(4px);
+  }
+  .hint{
+    position:absolute;
+    bottom:16px;
+    left:50%;
+    transform:translateX(-50%);
+    color:rgba(255,255,255,0.8);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto;
+    font-size:13px;
+    padding:6px 12px;
+    border-radius:999px;
+    background:rgba(0,0,0,0.3);
+    z-index:10;
+  }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+  <canvas id="c"></canvas>
+
+  <div class="controls" id="controls">
+    <button class="btn" id="permBtn" title="Required on some iOS devices">Enable Motion</button>
+    <button class="btn" id="impulseBtn">Nudge</button>
+    <button class="btn" id="resetBtn">Reset</button>
+  </div>
+
+  <div class="hint" id="hint">Shake phone or swipe left↔right repeatedly to bobble. (Space or Nudge button works too.)</div>
+</div>
+
+<script>
+/*
+  Bobble Head Viewer
+  Updated to use IPFS asset CIDs
+*/
+
+/* ---------- Configurable parameters ---------- */
+const BOBBLE_IMAGE = 'https://ipfs.io/ipfs/bafybeifkb2zpkrpwbp2loji5jwiwpgtwylyoz44bjqtoud2xjzax4nqwjy'; 
+const BG_IMAGE = 'https://ipfs.io/ipfs/bafybeickuvhf25xbt65zd7a3c5wa3rj4agep6gkvo2arh3kavanmnrpkoe';
+
+const SPRITE_SCALE = 0.6;
+const PIVOT_Y_FACTOR = 0.85;
+const SPRING_STIFFNESS = 14.0;
+const DAMPING = 3;
+const MASS = 1.25;
+const IMPULSE_PER_TRIGGER = 2;
+const SHAKE_THRESHOLD = 14;
+const SHAKE_COOLDOWN_MS = 250;
+const SWIPE_WINDOW_MS = 700;
+const SWIPE_MIN_CHANGES = 3;
+
+/* ---------- Canvas & assets ---------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: true });
+
+let DPR = window.devicePixelRatio || 1;
+function resizeCanvas(){
+  DPR = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(rect.width * DPR));
+  canvas.height = Math.max(1, Math.floor(rect.height * DPR));
+}
+window.addEventListener('resize', resizeCanvas, { passive:true });
+
+const bg = new Image();
+bg.src = BG_IMAGE;
+
+const sprite = new Image();
+sprite.src = BOBBLE_IMAGE;
+
+/* ---------- Bobble physics state ---------- */
+let angle = 0;
+let angularVelocity = 0;
+let lastTime = performance.now();
+let running = true;
+
+/* ---------- Rendering layout ---------- */
+let spriteW = 0, spriteH = 0;
+let spriteX = 0, spriteY = 0;
+let pivotX = 0, pivotY = 0;
+
+function computeLayout(){
+  const ch = canvas.height;
+  const targetH = ch * SPRITE_SCALE;
+  const aspect = (sprite.width && sprite.height) ? (sprite.width/sprite.height) : 1;
+
+  spriteH = targetH;
+  spriteW = targetH * aspect;
+  spriteX = (canvas.width - spriteW) / 2;
+  spriteY = (canvas.height - spriteH) * 0.50;
+
+  pivotX = spriteX + spriteW/2;
+  pivotY = spriteY + spriteH * PIVOT_Y_FACTOR;
+}
+
+/* ---------- Physics ---------- */
+function physicsStep(dt){
+  const springTorque = -SPRING_STIFFNESS * angle;
+  const dampingTorque = -DAMPING * angularVelocity;
+  const netTorque = springTorque + dampingTorque;
+  const angularAcc = netTorque / MASS;
+
+  angularVelocity += angularAcc * dt;
+  angle += angularVelocity * dt;
+}
+
+/* ---------- Draw ---------- */
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(bg.complete && bg.naturalWidth){
+    const cw = canvas.width, ch = canvas.height;
+    const iw = bg.naturalWidth, ih = bg.naturalHeight;
+    const scale = Math.max(cw/iw, ch/ih);
+    const iwS = iw*scale, ihS = ih*scale;
+    ctx.drawImage(bg, (cw - iwS)/2, (ch - ihS)/2, iwS, ihS);
+  } else {
+    ctx.fillStyle = '#0b0b0f';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  if(sprite.complete && sprite.naturalWidth){
+    ctx.save();
+    ctx.translate(pivotX, pivotY);
+    ctx.rotate(angle);
+
+    const dx = -(pivotX - spriteX);
+    const dy = -(pivotY - spriteY);
+
+    ctx.drawImage(sprite, dx, dy, spriteW, spriteH);
+    ctx.restore();
+  }
+}
+
+/* ---------- Animation loop ---------- */
+function frame(now){
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+  physicsStep(dt);
+  draw();
+  if(running) requestAnimationFrame(frame);
+}
+
+/* ---------- Trigger ---------- */
+function triggerBobble(impulse = IMPULSE_PER_TRIGGER, direction = 0){
+  const sign = direction === 0 ? (Math.random()<0.5?-1:1) : (direction<0?-1:1);
+  angularVelocity += sign * impulse;
+}
+
+/* ---------- Motion Detection ---------- */
+let lastShakeAt = 0;
+function handleDeviceMotion(e){
+  const a = e.accelerationIncludingGravity || e.acceleration;
+  if(!a) return;
+  const mag = Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
+  const now = performance.now();
+  if(mag > SHAKE_THRESHOLD && (now - lastShakeAt) > SHAKE_COOLDOWN_MS){
+    lastShakeAt = now;
+    triggerBobble();
+  }
+}
+
+/* ---------- Gesture detection ---------- */
+let lastTouchX = null;
+let lastDirection = 0;
+let directionChanges = [];
+
+function onPointerDown(e){
+  lastTouchX = (e.touches ? e.touches[0].clientX : e.clientX);
+}
+function onPointerMove(e){
+  if(lastTouchX === null) return;
+  const x = (e.touches ? e.touches[0].clientX : e.clientX);
+  const dx = x - lastTouchX;
+  const dir = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+  const now = performance.now();
+
+  if(dir !== 0 && dir !== lastDirection){
+    directionChanges.push(now);
+    lastDirection = dir;
+
+    const cutoff = now - SWIPE_WINDOW_MS;
+    directionChanges = directionChanges.filter(t => t >= cutoff);
+
+    if(directionChanges.length >= SWIPE_MIN_CHANGES){
+      const mult = Math.min(4, directionChanges.length);
+      triggerBobble(IMPULSE_PER_TRIGGER * mult, dir);
+      directionChanges = [];
+    }
+  }
+  lastTouchX = x;
+}
+function onPointerUp(){ lastTouchX=null; lastDirection=0; }
+
+/* Mouse + touch */
+canvas.addEventListener('mousedown', e=>{ onPointerDown(e); });
+window.addEventListener('mousemove', e=>{ if(lastTouchX!==null) onPointerMove(e); });
+window.addEventListener('mouseup', e=>{ onPointerUp(e); });
+
+canvas.addEventListener('touchstart', e=> onPointerDown(e), {passive:true});
+canvas.addEventListener('touchmove', e=> onPointerMove(e), {passive:true});
+window.addEventListener('touchend', e=> onPointerUp(e), {passive:true});
+
+/* Keyboard */
+window.addEventListener('keydown', e=>{
+  if(e.code === 'Space'){ e.preventDefault(); triggerBobble(); }
+  if(e.key === 'ArrowLeft') triggerBobble(IMPULSE_PER_TRIGGER, -1);
+  if(e.key === 'ArrowRight') triggerBobble(IMPULSE_PER_TRIGGER, 1);
+});
+
+/* Buttons */
+document.getElementById('impulseBtn').addEventListener('click', ()=> triggerBobble());
+document.getElementById('resetBtn').addEventListener('click', ()=>{ angle=0; angularVelocity=0; });
+
+/* iOS Motion Permission */
+const permBtn = document.getElementById('permBtn');
+async function requestMotionPermission(){
+  if(typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+    try{
+      const resp = await DeviceMotionEvent.requestPermission();
+      if(resp === 'granted'){
+        window.addEventListener('devicemotion', handleDeviceMotion, {passive:true});
+        permBtn.textContent = 'Motion Enabled';
+        permBtn.disabled = true;
+      } else {
+        permBtn.textContent = 'Permission Denied';
+      }
+    } catch(err){
+      permBtn.textContent = 'Permission Error';
+    }
+  } else {
+    window.addEventListener('devicemotion', handleDeviceMotion, {passive:true});
+    permBtn.textContent = 'Motion Enabled';
+    permBtn.disabled = true;
+  }
+}
+permBtn.addEventListener('click', requestMotionPermission);
+
+if(!(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function')){
+  window.addEventListener('devicemotion', handleDeviceMotion, {passive:true});
+  permBtn.style.display = 'none';
+}
+
+/* Start */
+function start(){
+  resizeCanvas();
+  computeLayout();
+  lastTime = performance.now();
+  requestAnimationFrame(frame);
+}
+sprite.onload = ()=>{ computeLayout(); start(); };
+bg.onload = ()=> computeLayout();
+
+resizeCanvas();
+</script>
+</body>
+</html>
